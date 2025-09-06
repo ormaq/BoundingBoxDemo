@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bounding Box Tech Demo</title>
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --fg: #e6edf3;
+      --accent: #7cc4ff;
+      --edge: rgba(124, 196, 255, 0.9);
+      --fill: rgba(124, 196, 255, 0.12);
+      --handle: #ffffff;
+      --handle-stroke: #222;
+      --hud: rgba(0,0,0,0.55);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    /* Stage centers the image and overlays */
+    #stage {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: 100vw;    /* default until image loads */
+      height: 100vh;   /* default until image loads */
+      outline: 1px solid rgba(255,255,255,0.04);
+      background: #000;
+      user-select: none;
+      touch-action: none;
+    }
+
+    #sourceImg {
+      position: absolute;
+      left: 0; top: 0; width: 100%; height: 100%;
+      object-fit: contain; /* we still compute exact mapping in JS */
+      image-rendering: crisp-edges;
+      image-rendering: pixelated;
+      filter: saturate(1.02) contrast(1.02);
+      pointer-events: none; /* let pointer events go to overlay */
+    }
+
+    #overlay {
+      position: absolute;
+      left: 0; top: 0; width: 100%; height: 100%;
+      pointer-events: none; /* enabled only for handles */
+    }
+
+    #quad {
+      fill: var(--fill);
+      stroke: var(--edge);
+      stroke-width: 1.25;
+      vector-effect: non-scaling-stroke; /* keep stroke crisp at any zoom */
+    }
+
+    /* Handles live in their own <g> with pointer-events enabled */
+    .handle {
+      fill: var(--handle);
+      stroke: var(--handle-stroke);
+      stroke-width: 0.75;
+      vector-effect: non-scaling-stroke;
+      cursor: pointer;
+      pointer-events: all; /* enable dragging */
+      rx: 1; ry: 1;
+    }
+
+    .handle.mid { fill: #ffe58a; }
+    .handle.corner { fill: #9cff9c; }
+
+    #loupe {
+      position: absolute; /* anchor to stage, not viewport */
+      display: none;
+      border: 1px solid rgba(255,255,255,0.8);
+      background: #000;
+      image-rendering: pixelated; /* for CSS upscales if any */
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      z-index: 20;
+      pointer-events: none; /* don't block drag */
+    }
+
+    #hud {
+      position: fixed; left: 12px; bottom: 12px; z-index: 30;
+      background: var(--hud);
+      color: var(--fg);
+      padding: 10px 12px; border-radius: 10px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.05) inset;
+    }
+    #hud kbd { background: rgba(255,255,255,0.12); padding: 1px 6px; border-radius: 6px; }
+    #hud .status { opacity: 0.9; font-weight: 600; }
+
+    #coords {
+      position: fixed; right: 12px; bottom: 12px; z-index: 30;
+      background: var(--hud);
+      padding: 8px 10px; border-radius: 8px; font-variant-numeric: tabular-nums;
+    }
+    code { color: #a0e7ff; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <img id="sourceImg" src="image.png" alt="Demo image" />
+    <svg id="overlay" viewBox="0 0 1397 1188" preserveAspectRatio="none" aria-hidden="true">
+      <polygon id="quad" points="" />
+      <g id="handles"></g>
+    </svg>
+    <canvas id="loupe" width="160" height="160"></canvas>
+  </div>
+
+  <div id="hud">
+    <div><strong>Bounding Box Tech Demo</strong></div>
+    <div>Drag the <span style="color:#9cff9c">green</span> corners or <span style="color:#ffe58a">yellow</span> midpoints.</div>
+    <div><kbd>Alt</kbd> = <span class="status" id="mode">Distort ON while held</span></div>
+    <div>Zoom loupe appears while dragging. Coordinates snap to whole pixels.</div>
+  </div>
+  <div id="coords">—</div>
+
+<script>
+(() => {
+  const imgEl = document.getElementById('sourceImg');
+  const stage = document.getElementById('stage');
+  const overlay = document.getElementById('overlay');
+  const quad = document.getElementById('quad');
+  const handlesG = document.getElementById('handles');
+  const loupe = document.getElementById('loupe');
+  const hudMode = document.getElementById('mode');
+  const coordsEl = document.getElementById('coords');
+
+  // Offscreen canvas to sample the image at native resolution
+  const off = document.createElement('canvas');
+  const offctx = off.getContext('2d', { willReadFrequently: true });
+
+  // State
+  let imgW = 1397, imgH = 1188; // defaults
+  let scale = 1;                 // pixels on screen per image pixel
+  let rect = null;               // stage DOMRect
+  let altPressed = false;
+  let dragging = null;           // { type: 'corner'|'mid', idx, start:{x,y}, corners:[...clone...] }
+
+  // Corners in image coordinates (clockwise TL, TR, BR, BL)
+  let corners = [
+    {x: 200, y: 160},
+    {x: 1197, y: 160},
+    {x: 1197, y: 1028},
+    {x: 200, y: 1028},
+  ];
+
+  // Create 8 handles (4 corners + 4 mids)
+  const handleElems = [];
+  function createHandles() {
+    handlesG.innerHTML = '';
+    const kinds = [
+      { type: 'corner', idx: 0 }, { type: 'corner', idx: 1 }, { type: 'corner', idx: 2 }, { type: 'corner', idx: 3 },
+      { type: 'mid', idx: 0 }, { type: 'mid', idx: 1 }, { type: 'mid', idx: 2 }, { type: 'mid', idx: 3 },
+    ];
+    kinds.forEach(k => {
+      const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      r.classList.add('handle', k.type);
+      r.dataset.type = k.type;
+      r.dataset.idx = String(k.idx);
+      r.setAttribute('width', 10);
+      r.setAttribute('height', 10);
+      r.addEventListener('pointerdown', onHandleDown);
+      handlesG.appendChild(r);
+      handleElems.push(r);
+    });
+  }
+
+  function cloneCorners() { return corners.map(p => ({x: p.x, y: p.y})); }
+
+  function midpoint(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+
+  function updateOverlay() {
+    // Update polygon points
+    quad.setAttribute('points', corners.map(p => `${p.x},${p.y}`).join(' '));
+
+    // Handle size so it stays visually ~10px regardless of zoom
+    const s = Math.max(8 / scale, 5 / scale);
+
+    // Corner handles indices 0..3
+    const mids = [
+      midpoint(corners[0], corners[1]),
+      midpoint(corners[1], corners[2]),
+      midpoint(corners[2], corners[3]),
+      midpoint(corners[3], corners[0])
+    ];
+
+    // Update positions: order matches createHandles order
+    const positions = [
+      corners[0], corners[1], corners[2], corners[3],
+      mids[0], mids[1], mids[2], mids[3]
+    ];
+
+    handleElems.forEach((el, i) => {
+      const p = positions[i];
+      el.setAttribute('x', (p.x - s/2).toFixed(3));
+      el.setAttribute('y', (p.y - s/2).toFixed(3));
+      el.setAttribute('width', s.toFixed(3));
+      el.setAttribute('height', s.toFixed(3));
+    });
+
+    // Coordinates readout
+    coordsEl.innerHTML = `TL <code>${fmt(corners[0])}</code> · TR <code>${fmt(corners[1])}</code> · BR <code>${fmt(corners[2])}</code> · BL <code>${fmt(corners[3])}</code>`;
+  }
+
+  function fmt(p) { return `${Math.round(p.x)},${Math.round(p.y)}`; }
+
+  function updateStageSize() {
+    // Fit image into viewport while preserving AR
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const sx = vw / imgW;
+    const sy = vh / imgH;
+    scale = Math.min(sx, sy);
+
+    const w = Math.round(imgW * scale);
+    const h = Math.round(imgH * scale);
+    stage.style.width = w + 'px';
+    stage.style.height = h + 'px';
+
+    // Keep SVG viewBox in image coordinates
+    overlay.setAttribute('viewBox', `0 0 ${imgW} ${imgH}`);
+
+    rect = stage.getBoundingClientRect();
+    updateOverlay();
+  }
+
+  function clientToImageXY(clientX, clientY) {
+    // Convert client coords to image pixel coordinates
+    rect = rect || stage.getBoundingClientRect();
+    const x = (clientX - rect.left) / scale;
+    const y = (clientY - rect.top) / scale;
+    return { x: clamp(Math.round(x), 0, imgW), y: clamp(Math.round(y), 0, imgH) };
+  }
+
+  function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+  function onHandleDown(e) {
+    e.preventDefault();
+    const type = e.currentTarget.dataset.type;
+    const idx = parseInt(e.currentTarget.dataset.idx, 10);
+
+    const start = clientToImageXY(e.clientX, e.clientY);
+    dragging = { type, idx, start, corners: cloneCorners() };
+
+    e.currentTarget.setPointerCapture(e.pointerId);
+
+    // show loupe immediately at pointer
+    loupe.style.display = 'block';
+    onPointerMove(e);
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp, { once: true });
+  }
+
+  function onPointerMove(e) {
+    if (!dragging) return;
+
+    // Track Alt live while dragging
+    altPressed = !!(e.altKey);
+    hudMode.textContent = altPressed ? 'Distort ON (Alt held)' : 'Distort OFF (release Alt)';
+
+    const pos = clientToImageXY(e.clientX, e.clientY);
+    const { type, idx, start, corners: startCorners } = dragging;
+
+    // Position and draw loupe
+    drawLoupe(pos, e.clientX, e.clientY);
+
+    if (altPressed) {
+      // Distort mode: corner moves freely; mid moves both adjacent corners
+      if (type === 'corner') {
+        corners[idx].x = pos.x; corners[idx].y = pos.y;
+      } else { // midedges: idx 0: top (0-1), 1: right (1-2), 2: bottom (2-3), 3: left (3-0)
+        const pairs = [[0,1],[1,2],[2,3],[3,0]][idx];
+        const dx = pos.x - start.x;
+        const dy = pos.y - start.y;
+        corners[pairs[0]].x = clamp(startCorners[pairs[0]].x + dx, 0, imgW);
+        corners[pairs[0]].y = clamp(startCorners[pairs[0]].y + dy, 0, imgH);
+        corners[pairs[1]].x = clamp(startCorners[pairs[1]].x + dx, 0, imgW);
+        corners[pairs[1]].y = clamp(startCorners[pairs[1]].y + dy, 0, imgH);
+      }
+    } else {
+      // Rectangle mode: preserve axis-aligned rectangle
+      // Compute current rect bounds from startCorners
+      let x1 = Math.min(startCorners[0].x, startCorners[3].x);
+      let x2 = Math.max(startCorners[1].x, startCorners[2].x);
+      let y1 = Math.min(startCorners[0].y, startCorners[1].y);
+      let y2 = Math.max(startCorners[2].y, startCorners[3].y);
+
+      if (type === 'corner') {
+        // Opposite corner stays fixed
+        if (idx === 0) { x1 = pos.x; y1 = pos.y; }
+        if (idx === 1) { x2 = pos.x; y1 = pos.y; }
+        if (idx === 2) { x2 = pos.x; y2 = pos.y; }
+        if (idx === 3) { x1 = pos.x; y2 = pos.y; }
+      } else {
+        if (idx === 0) { y1 = pos.y; } // top
+        if (idx === 1) { x2 = pos.x; } // right
+        if (idx === 2) { y2 = pos.y; } // bottom
+        if (idx === 3) { x1 = pos.x; } // left
+      }
+
+      // Clamp to image bounds and avoid inverted rects by swapping
+      x1 = clamp(x1, 0, imgW); x2 = clamp(x2, 0, imgW);
+      y1 = clamp(y1, 0, imgH); y2 = clamp(y2, 0, imgH);
+      if (x1 > x2) [x1, x2] = [x2, x1];
+      if (y1 > y2) [y1, y2] = [y2, y1];
+
+      corners[0] = { x: x1, y: y1 };
+      corners[1] = { x: x2, y: y1 };
+      corners[2] = { x: x2, y: y2 };
+      corners[3] = { x: x1, y: y2 };
+    }
+
+    updateOverlay();
+  }
+
+  function onPointerUp(e) {
+    window.removeEventListener('pointermove', onPointerMove);
+    loupe.style.display = 'none';
+    dragging = null;
+  }
+
+  function drawLoupe(imgPos, clientX, clientY) {
+    const zoom = 6;      // magnification
+    const sample = 28;   // side in source pixels
+    const pad = 4;       // offset from cursor
+
+    const w = sample * zoom, h = sample * zoom;
+    loupe.width = w; loupe.height = h;
+
+    rect = stage.getBoundingClientRect();
+    const stageX = clientX - rect.left;
+    const stageY = clientY - rect.top;
+
+    // Position near cursor but keep inside STAGE bounds (not viewport)
+    let left = stageX + pad;
+    let top = stageY + pad;
+    if (left + w > rect.width - 4) left = stageX - pad - w;
+    if (top + h > rect.height - 4) top = stageY - pad - h;
+    loupe.style.left = left + 'px';
+    loupe.style.top = top + 'px';
+
+    const ctx = loupe.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, w, h);
+
+    // Sample region centered at imgPos
+    const sx = clamp(Math.floor(imgPos.x) - Math.floor(sample/2), 0, Math.max(0, imgW - sample));
+    const sy = clamp(Math.floor(imgPos.y) - Math.floor(sample/2), 0, Math.max(0, imgH - sample));
+
+    ctx.drawImage(off, sx, sy, sample, sample, 0, 0, w, h);
+
+    // Draw pixel grid
+    ctx.save();
+    ctx.globalAlpha = 0.2;
+    ctx.beginPath();
+    for (let i=0;i<=sample;i++) {
+      const x = Math.round(i * zoom) + 0.5;
+      ctx.moveTo(x, 0); ctx.lineTo(x, h);
+      const y = Math.round(i * zoom) + 0.5;
+      ctx.moveTo(0, y); ctx.lineTo(w, y);
+    }
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+
+    // Crosshair at center
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 2;
+    const cx = Math.floor(sample/2) * zoom + Math.floor(zoom/2) + 0.5;
+    const cy = Math.floor(sample/2) * zoom + Math.floor(zoom/2) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, cy); ctx.lineTo(w, cy);
+    ctx.moveTo(cx, 0); ctx.lineTo(cx, h);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function onKey(e) {
+    if (e.type === 'keydown' && e.key === 'Alt') altPressed = true;
+    if (e.type === 'keyup' && e.key === 'Alt') altPressed = false;
+    hudMode.textContent = altPressed ? 'Distort ON (Alt held)' : 'Distort OFF (release Alt)';
+  }
+
+  function initWithImage() {
+    // When the image loads, set up offscreen canvas and stage sizing
+    imgW = imgEl.naturalWidth || imgW;
+    imgH = imgEl.naturalHeight || imgH;
+
+    off.width = imgW; off.height = imgH;
+    offctx.imageSmoothingEnabled = false;
+    offctx.clearRect(0,0,imgW,imgH);
+    offctx.drawImage(imgEl, 0, 0, imgW, imgH);
+
+    // Initialize a nice inset rectangle if defaults were odd
+    corners = [
+      {x: Math.round(imgW * 0.15), y: Math.round(imgH * 0.15)},
+      {x: Math.round(imgW * 0.85), y: Math.round(imgH * 0.15)},
+      {x: Math.round(imgW * 0.85), y: Math.round(imgH * 0.85)},
+      {x: Math.round(imgW * 0.15), y: Math.round(imgH * 0.85)},
+    ];
+
+    updateStageSize();
+  }
+
+  // Resize observer keeps overlay crisp on window resizes
+  window.addEventListener('resize', () => {
+    updateStageSize();
+  });
+
+  // Keyboard state for Alt (distort)
+  window.addEventListener('keydown', onKey);
+  window.addEventListener('keyup', onKey);
+
+  // Create handles and do a first layout
+  createHandles();
+  updateStageSize();
+
+  // Load image. If it fails, we still keep defaults
+  if (imgEl.complete) initWithImage();
+  imgEl.addEventListener('load', initWithImage);
+
+})();
+</script>
+</body>
+</html>
